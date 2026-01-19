@@ -6,6 +6,19 @@
 #define IBUS_RX_PIN 20
 #define IBUS_TX_PIN 21
 
+#define LED_PIN 8
+#define PWM_CH  0
+#define PWM_FREQ 2000
+#define PWM_RES  8
+#define GAMMA 1.8
+
+// LCM (Light Control Module) address for IBUS dimmer messages
+#define LCM_ADDR 0xD0
+// Instrument backlighting command
+#define CMD_DIMMER 0x5C
+// Default brightness (0-100) when no IBUS message received
+#define DEFAULT_BRIGHTNESS 50
+
 IbusTrx ibus;
 byte source, length, destination, databytes[36];
 
@@ -86,6 +99,7 @@ hw_timer_t * timer = NULL;
 
 void IRAM_ATTR onTimer();
 void initTimer();
+void setBrightness(uint8_t linValue);
 
 void scheduleFrame(ButtonCommand cmd) { 
   heldCommand = cmd; 
@@ -144,7 +158,26 @@ void setup()
   digitalWrite(CRUISE_TX_PIN, HIGH);
   initTimer();
 
+  ledcSetup(PWM_CH, PWM_FREQ, PWM_RES);
+  ledcAttachPin(LED_PIN, PWM_CH);
+  setBrightness(DEFAULT_BRIGHTNESS);
+
   Serial.println("Forty6 Steeringhub started");
+}
+
+uint8_t gammaCorrect(uint8_t value) {
+  float normalized = value / 255.0;
+  float corrected = pow(normalized, GAMMA);
+  return (uint8_t)(corrected * 255.0 + 0.5);
+}
+
+void setBrightness(uint8_t linValue) {
+  linValue = constrain(linValue, 0, 100);
+
+  uint8_t pwm = map(linValue, 0, 100, 0, 255);
+  pwm = gammaCorrect(pwm);
+
+  ledcWrite(PWM_CH, pwm);
 }
 
 void dispatchButton(ButtonType type) {
@@ -171,9 +204,39 @@ void checkPins() {
   }
 }
 
+void handleIbusMessage() {
+  IbusMessage message = ibus.readMessage();
+  uint8_t src = message.source();
+  uint8_t len = message.length();
+
+  // Look for dimmer/brightness messages from LCM
+  // LCM sends brightness status with command byte 0x5C
+  if (src == LCM_ADDR && len >= 2) {
+    uint8_t cmd = message.b(0);
+
+    if (cmd == CMD_DIMMER && len >= 2) {
+      // The brightness value is typically in the second data byte
+      // Value range: 0x00 (dark) to 0xFF (bright)
+      uint8_t brightness = message.b(1);
+
+      // Map 0-255 to 0-100 for our setBrightness function
+      uint8_t mappedBrightness = map(brightness, 0, 255, 0, 100);
+      setBrightness(mappedBrightness);
+
+      Serial.print("IBUS Dimmer: ");
+      Serial.print(brightness);
+      Serial.print(" -> ");
+      Serial.println(mappedBrightness);
+    }
+  }
+}
+
 void loop()
 {
-  ibus.available();
+  if (ibus.available()) {
+    handleIbusMessage();
+  }
+
   checkPins();
 }
 

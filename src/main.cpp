@@ -3,31 +3,59 @@
 #include "E46_Codes.h"
 #include <IbusTrx.h>
 
-#define IBUS_RX_PIN 20
-#define IBUS_TX_PIN 21
+// Pin definitions
+#define IBUS_RX_PIN       20
+#define IBUS_TX_PIN       21
+#define LED_PIN           8
+#define MODE_SWITCH_PIN   10
+#define CRUISE_TX_PIN     9
 
-#define LED_PIN 8
-#define PWM_CH  0
-#define PWM_FREQ 2000
-#define PWM_RES  8
-#define GAMMA 1.8
+#define BTN_PIN_0         0
+#define BTN_PIN_1         1
+#define BTN_PIN_2         2
+#define BTN_PIN_3         3
+#define BTN_PIN_4         4
+#define BTN_PIN_5         5
+#define BTN_PIN_6         6
+#define BTN_PIN_7         7
 
-// LCM (Light Control Module) address for IBUS dimmer messages
-#define LCM_ADDR 0xD0
-// Instrument backlighting command
-#define CMD_DIMMER 0x5C
-// Default brightness (0-100) when no IBUS message received
-#define DEFAULT_BRIGHTNESS 50
+// PWM configuration
+#define PWM_CHANNEL       0
+#define PWM_FREQ_HZ       2000
+#define PWM_RESOLUTION    8
+#define GAMMA_CORRECTION  1.8f
+
+// Serial configuration
+#define SERIAL_BAUD_RATE  115200
+#define IBUS_BAUD_RATE    9600
+
+// IBUS addresses and commands
+#define LCM_ADDR          0xD0
+#define IBUS_CMD_DIMMER   0x5C
+
+// Brightness settings (0-100 range)
+#define DEFAULT_BRIGHTNESS    50
+#define BRIGHTNESS_MIN        0
+#define BRIGHTNESS_MAX        100
+#define PWM_VALUE_MIN         0
+#define PWM_VALUE_MAX         255
+
+// Timer configuration for 1MHz tick rate (80MHz / 80 prescaler)
+#define TIMER_INDEX           0
+#define TIMER_PRESCALER       80
+#define TIMER_INTERVAL_US     100
+#define TICKS_FOR_GAP         100
+
+// Cruise control bit timing in timer ticks
+#define BIT_HIGH_TICKS_ONE    4
+#define BIT_LOW_TICKS_ONE     2
+#define BIT_HIGH_TICKS_ZERO   2
+#define BIT_LOW_TICKS_ZERO    4
+#define STOP_BIT_TICKS        3
+#define BITS_PER_BYTE         8
 
 IbusTrx ibus;
-byte source, length, destination, databytes[36];
 
-const int modeSwitchPin = 10;
-const int CRUISE_TX_PIN = 9;
-
-// =====================
-// TYPES
-// =====================
 enum ButtonType {
   VOID,
   BTN_CRUISE_MINUS,
@@ -49,36 +77,33 @@ struct ButtonAction {
 };
 
 struct PinButtonMap {
-  int pin;
+  uint8_t pin;
   ButtonType type;
   ButtonType alternativeType;
   bool lastState;
 };
 
-// Pin mappings
-// Depending on the mode, other dispatch function is used
+// Pin to button mappings with alternative actions when mode switch is active
 PinButtonMap pinMapping[] = {
-  { 0, BTN_CRUISE_MINUS, BTN_FLASH_HIGHBEAM, false },
-  { 1, BTN_CRUISE_PLUS,  VOID,               false },
-  { 2, BTN_CRUISE_IO,    VOID,               false },
-  { 3, BTN_CRUISE_RESET, VOID,               false },
-  { 4, BTN_VOL_UP,       VOID,               false },
-  { 5, BTN_VOL_DOWN,     VOID,               false },
-  { 6, BTN_NEXT,         VOID,               false },
-  { 7, BTN_PREV,         VOID,               false },
+  { BTN_PIN_0, BTN_CRUISE_MINUS, BTN_FLASH_HIGHBEAM, false },
+  { BTN_PIN_1, BTN_CRUISE_PLUS,  VOID,               false },
+  { BTN_PIN_2, BTN_CRUISE_IO,    VOID,               false },
+  { BTN_PIN_3, BTN_CRUISE_RESET, VOID,               false },
+  { BTN_PIN_4, BTN_VOL_UP,       VOID,               false },
+  { BTN_PIN_5, BTN_VOL_DOWN,     VOID,               false },
+  { BTN_PIN_6, BTN_NEXT,         VOID,               false },
+  { BTN_PIN_7, BTN_PREV,         VOID,               false },
 };
 
+// Cruise control command bytes
 enum ButtonCommand : uint8_t {
-  CMD_KEEPALIVE1 = 255, // 11111111
-  CMD_KEEPALIVE2 = 254, // 11111110
+  CMD_KEEPALIVE1 = 255,
+  CMD_KEEPALIVE2 = 254,
   CMD_IO         = 219,
   CMD_RESET      = 111,
   CMD_PLUS       = 183,
-  CMD_MINUS      = 253 
+  CMD_MINUS      = 253
 };
-
-const uint64_t TIMER_INTERVAL_US = 100;
-const int TICKS_FOR_GAP          = 100;
 
 enum TxState {
   TX_IDLE,
@@ -91,11 +116,11 @@ volatile TxState txState = TX_IDLE;
 volatile ButtonCommand heldCommand = CMD_KEEPALIVE1;
 volatile bool keepAliveToggle = false;
 volatile uint8_t currentByte = 0;
-volatile int bitIndex = 8; 
-volatile int tickCounter = 0;
-volatile int lowPulseTicks = 0;
+volatile uint8_t bitIndex = BITS_PER_BYTE;
+volatile uint16_t tickCounter = 0;
+volatile uint8_t lowPulseTicks = 0;
 
-hw_timer_t * timer = NULL; 
+hw_timer_t* timer = NULL; 
 
 void IRAM_ATTR onTimer();
 void initTimer();
@@ -105,8 +130,7 @@ void scheduleFrame(ButtonCommand cmd) {
   heldCommand = cmd; 
 }
 
-// Media buttons (MFL module, source 0x68)
-// https://curious.ninja/blog/arduino-bmw-i-bus-interface-messages/
+// IBUS media button messages for MFL module (source 0x68)
 uint8_t NEXT_TRACK[7] PROGMEM = {0x50, 0x04, 0x68, 0x3B, 0x01, 0x06};
 uint8_t PREV_TRACK[7] PROGMEM = {0x50, 0x04, 0x68, 0x3B, 0x08, 0x0F};
 uint8_t FLASH_HIGHBEAM[5] PROGMEM = {0x00, 0x04, 0xbf, 0x08};
@@ -142,42 +166,42 @@ ButtonAction actions[] = {
 
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD_RATE);
 
-  Serial1.begin(9600, SERIAL_8E1, IBUS_RX_PIN, IBUS_TX_PIN);
+  Serial1.begin(IBUS_BAUD_RATE, SERIAL_8E1, IBUS_RX_PIN, IBUS_TX_PIN);
   ibus.begin(Serial1);
 
-  pinMode(modeSwitchPin, INPUT_PULLUP);
+  pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
 
-  for (auto &map : pinMapping) {
-    pinMode(map.pin, INPUT_PULLUP);
+  for (auto &mapping : pinMapping) {
+    pinMode(mapping.pin, INPUT_PULLUP);
   }
 
   pinMode(CRUISE_TX_PIN, OUTPUT);
   digitalWrite(CRUISE_TX_PIN, HIGH);
   initTimer();
 
-  ledcSetup(PWM_CH, PWM_FREQ, PWM_RES);
-  ledcAttachPin(LED_PIN, PWM_CH);
+  ledcSetup(PWM_CHANNEL, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcAttachPin(LED_PIN, PWM_CHANNEL);
   setBrightness(DEFAULT_BRIGHTNESS);
 
   Serial.println("Forty6 Steeringhub started");
 }
 
 uint8_t gammaCorrect(uint8_t value) {
-  float normalized = value / 255.0;
-  float corrected = pow(normalized, GAMMA);
-  return (uint8_t)(corrected * 255.0 + 0.5);
+  float normalized = value / (float)PWM_VALUE_MAX;
+  float corrected = pow(normalized, GAMMA_CORRECTION);
+  return (uint8_t)(corrected * PWM_VALUE_MAX + 0.5f);
 }
 
 void setBrightness(uint8_t linValue) {
-  linValue = constrain(linValue, 0, 100);
+  linValue = constrain(linValue, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
 
-  uint8_t pwm = map(linValue, 0, 100, 0, 255);
+  uint8_t pwm = map(linValue, BRIGHTNESS_MIN, BRIGHTNESS_MAX, PWM_VALUE_MIN, PWM_VALUE_MAX);
   pwm = gammaCorrect(pwm);
 
-  ledcWrite(PWM_CH, pwm);
+  ledcWrite(PWM_CHANNEL, pwm);
 }
 
 void dispatchButton(ButtonType type) {
@@ -190,17 +214,17 @@ void dispatchButton(ButtonType type) {
 }
 
 void checkPins() {
-  for (auto &map : pinMapping) {
-    bool pressed = (digitalRead(map.pin) == LOW);
-    if (pressed && !map.lastState) {
-      if (map.alternativeType != VOID && digitalRead(modeSwitchPin) == LOW) {
-        dispatchButton(map.alternativeType);
+  for (auto &mapping : pinMapping) {
+    bool pressed = (digitalRead(mapping.pin) == LOW);
+    if (pressed && !mapping.lastState) {
+      if (mapping.alternativeType != VOID && digitalRead(MODE_SWITCH_PIN) == LOW) {
+        dispatchButton(mapping.alternativeType);
       } else {
-        dispatchButton(map.type);
+        dispatchButton(mapping.type);
       }
     }
 
-    map.lastState = pressed;
+    mapping.lastState = pressed;
   }
 }
 
@@ -209,18 +233,13 @@ void handleIbusMessage() {
   uint8_t src = message.source();
   uint8_t len = message.length();
 
-  // Look for dimmer/brightness messages from LCM
-  // LCM sends brightness status with command byte 0x5C
+  // Handle dimmer brightness messages from Light Control Module
   if (src == LCM_ADDR && len >= 2) {
     uint8_t cmd = message.b(0);
 
-    if (cmd == CMD_DIMMER && len >= 2) {
-      // The brightness value is typically in the second data byte
-      // Value range: 0x00 (dark) to 0xFF (bright)
+    if (cmd == IBUS_CMD_DIMMER && len >= 2) {
       uint8_t brightness = message.b(1);
-
-      // Map 0-255 to 0-100 for our setBrightness function
-      uint8_t mappedBrightness = map(brightness, 0, 255, 0, 100);
+      uint8_t mappedBrightness = map(brightness, PWM_VALUE_MIN, PWM_VALUE_MAX, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
       setBrightness(mappedBrightness);
 
       Serial.print("IBUS Dimmer: ");
@@ -240,15 +259,15 @@ void loop()
   checkPins();
 }
 
+// Initialize hardware timer for cruise control signal generation
 void initTimer() {
-  // ESP32-C3 compatible timer initialization
-  timer = timerBegin(0, 80, true);  // Timer 0, prescaler 80 (1MHz), count up
+  timer = timerBegin(TIMER_INDEX, TIMER_PRESCALER, true);
   if (timer == NULL) {
     Serial.println("Timer initialization failed!");
     return;
   }
   timerAttachInterrupt(timer, &onTimer, true);
-  timerAlarmWrite(timer, TIMER_INTERVAL_US, true);  // Trigger every 100us
+  timerAlarmWrite(timer, TIMER_INTERVAL_US, true);
   timerAlarmEnable(timer);
 }
 
@@ -256,32 +275,28 @@ void IRAM_ATTR onTimer() {
   tickCounter++;
 
   switch (txState) {
-    // --- Idle (bus HIGH) ---
     case TX_IDLE:
-      digitalWrite(CRUISE_TX_PIN, HIGH); // Ensure idle is HIGH
-      // Immediately start sending the next message
+      digitalWrite(CRUISE_TX_PIN, HIGH);
       tickCounter = 0;
       currentByte = (heldCommand == CMD_KEEPALIVE1 || heldCommand == CMD_KEEPALIVE2)
                     ? (keepAliveToggle ? CMD_KEEPALIVE2 : CMD_KEEPALIVE1)
                     : heldCommand;
       keepAliveToggle = !keepAliveToggle;
-      bitIndex = 8; // start with MSB
-      txState = TX_DATA_BIT; // first bit
+      bitIndex = BITS_PER_BYTE;
+      txState = TX_DATA_BIT;
       break;
 
-    // --- Data Bit Slot ---
     case TX_DATA_BIT: {
       bool bit = (currentByte >> (bitIndex - 1)) & 1;
 
-      int highTicks, lowTicks;
+      uint8_t highTicks = 0;
+      uint8_t lowTicks = 0;
       if (bit) {
-        // Bit 1: shorter LOW at the end
-        highTicks = 4;  // adjust as needed
-        lowTicks  = 2;
+        highTicks = BIT_HIGH_TICKS_ONE;
+        lowTicks  = BIT_LOW_TICKS_ONE;
       } else {
-        // Bit 0: longer LOW at the end
-        highTicks = 2;  // adjust as needed
-        lowTicks  = 4;
+        highTicks = BIT_HIGH_TICKS_ZERO;
+        lowTicks  = BIT_LOW_TICKS_ZERO;
       }
 
       if (tickCounter <= highTicks) {
@@ -289,31 +304,27 @@ void IRAM_ATTR onTimer() {
       } else if (tickCounter <= (highTicks + lowTicks)) {
         digitalWrite(CRUISE_TX_PIN, LOW);
       } else {
-        // End of slot
         tickCounter = 0;
         bitIndex--;
         if (bitIndex == 0) {
-          // All 8 bits sent, send stop bit (LOW 1/2 ticks for example)
-          lowPulseTicks = 3;
+          lowPulseTicks = STOP_BIT_TICKS;
           digitalWrite(CRUISE_TX_PIN, LOW);
           txState = TX_STOP_BIT;
         } else {
-          txState = TX_DATA_BIT; // next data bit
+          txState = TX_DATA_BIT;
         }
       }
       break;
     }
 
-    // --- Stop Bit ---
     case TX_STOP_BIT:
       if (tickCounter >= lowPulseTicks) {
         tickCounter = 0;
-        digitalWrite(CRUISE_TX_PIN, HIGH); // return to idle
+        digitalWrite(CRUISE_TX_PIN, HIGH);
         txState = TX_GAP;
       }
       break;
 
-    // --- Gap Between Messages ---
     case TX_GAP:
       digitalWrite(CRUISE_TX_PIN, HIGH);
       if (tickCounter >= TICKS_FOR_GAP) {

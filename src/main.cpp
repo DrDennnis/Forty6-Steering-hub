@@ -6,9 +6,9 @@
 // Pin definitions
 #define IBUS_RX_PIN       20
 #define IBUS_TX_PIN       21
-#define LED_PIN           8
+#define LED_PIN           6 //8
 #define MODE_SWITCH_PIN   10
-#define CRUISE_TX_PIN     9
+#define CRUISE_TX_PIN     7 //9
 
 #define BTN_PIN_0         0
 #define BTN_PIN_1         1
@@ -16,8 +16,8 @@
 #define BTN_PIN_3         3
 #define BTN_PIN_4         4
 #define BTN_PIN_5         5
-#define BTN_PIN_6         6
-#define BTN_PIN_7         7
+#define BTN_PIN_6         8
+#define BTN_PIN_7         9
 
 // PWM configuration
 #define PWM_CHANNEL       0

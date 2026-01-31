@@ -6,9 +6,9 @@
 // Pin definitions
 #define IBUS_RX_PIN       20
 #define IBUS_TX_PIN       21
-#define LED_PIN           6 //8
 #define MODE_SWITCH_PIN   10
-#define CRUISE_TX_PIN     7 //9
+#define LED_PIN           6
+#define CRUISE_TX_PIN     7
 
 #define BTN_PIN_0         0
 #define BTN_PIN_1         1
@@ -54,45 +54,41 @@
 #define STOP_BIT_TICKS        3
 #define BITS_PER_BYTE         8
 
+// Repeat interval for held buttons (milliseconds)
+#define BUTTON_REPEAT_DELAY_MS  200
+
 IbusTrx ibus;
 
-enum ButtonType {
-  VOID,
-  BTN_CRUISE_MINUS,
-  BTN_CRUISE_PLUS,
-  BTN_CRUISE_IO,
-  BTN_CRUISE_RESET,
-  BTN_VOL_UP,
-  BTN_VOL_DOWN,
-  BTN_NEXT,
-  BTN_PREV,
-  BTN_RT,
-  BTN_MODE,
-  BTN_FLASH_HIGHBEAM
-};
-
-struct ButtonAction {
-  ButtonType type;
-  void (*handler)();
-};
+// Forward declarations for button handlers
+void handleCruiseMinus();
+void handleCruisePlus();
+void handleCruiseIO();
+void handleCruiseReset();
+void handleVolUp();
+void handleVolDown();
+void handleNext();
+void handlePrev();
+void handleFlashHighbeam();
 
 struct PinButtonMap {
   uint8_t pin;
-  ButtonType type;
-  ButtonType alternativeType;
+  void (*handler)();
+  void (*alternativeHandler)();
+  bool repeats;
   bool lastState;
+  unsigned long lastActionTime;
 };
 
 // Pin to button mappings with alternative actions when mode switch is active
 PinButtonMap pinMapping[] = {
-  { BTN_PIN_0, BTN_CRUISE_MINUS, BTN_FLASH_HIGHBEAM, false },
-  { BTN_PIN_1, BTN_CRUISE_PLUS,  VOID,               false },
-  { BTN_PIN_2, BTN_CRUISE_IO,    VOID,               false },
-  { BTN_PIN_3, BTN_CRUISE_RESET, VOID,               false },
-  { BTN_PIN_4, BTN_VOL_UP,       VOID,               false },
-  { BTN_PIN_5, BTN_VOL_DOWN,     VOID,               false },
-  { BTN_PIN_6, BTN_NEXT,         VOID,               false },
-  { BTN_PIN_7, BTN_PREV,         VOID,               false },
+  { BTN_PIN_0, handleCruiseMinus, handleFlashHighbeam, true,  false, 0 },
+  { BTN_PIN_1, handleCruisePlus,  nullptr,             true,  false, 0 },
+  { BTN_PIN_2, handleCruiseIO,    nullptr,             false, false, 0 },  // Single press only
+  { BTN_PIN_3, handleCruiseReset, nullptr,             false, false, 0 },  // Single press only
+  { BTN_PIN_4, handleVolUp,       nullptr,             true,  false, 0 },
+  { BTN_PIN_5, handleVolDown,     nullptr,             true,  false, 0 },
+  { BTN_PIN_6, handleNext,        nullptr,             false, false, 0 },
+  { BTN_PIN_7, handlePrev,        nullptr,             false, false, 0 },
 };
 
 // Cruise control command bytes
@@ -136,7 +132,6 @@ uint8_t PREV_TRACK[7] PROGMEM = {0x50, 0x04, 0x68, 0x3B, 0x08, 0x0F};
 uint8_t FLASH_HIGHBEAM[5] PROGMEM = {0x00, 0x04, 0xbf, 0x08};
 uint8_t IBUS_MODE[5] PROGMEM = {0x68, 0x04, 0x3B, 0x40};
 
-void handleVoid()          {}
 void handleCruiseMinus()   { Serial.print("Cruise Minus pressed");        scheduleFrame(CMD_MINUS);   }
 void handleCruisePlus()    { Serial.print("Cruise Plus pressed");         scheduleFrame(CMD_PLUS);    }
 void handleCruiseIO()      { Serial.print("Cruise IO pressed");           scheduleFrame(CMD_IO);      }
@@ -145,24 +140,7 @@ void handleVolUp()         { Serial.print("Volume + pressed");            ibus.w
 void handleVolDown()       { Serial.print("Volume - pressed");            ibus.write(MFL_VOL_DOWN);   }
 void handleNext()          { Serial.print("Next track pressed");          ibus.write(NEXT_TRACK);     }
 void handlePrev()          { Serial.print("Prev track pressed");          ibus.write(PREV_TRACK);     }
-void handleRT()            { Serial.print("R/T pressed");                 ibus.write(MFL_RT_PRESS);   }
-void handleMode()          { Serial.print("Mode pressed");                ibus.write(IBUS_MODE);      }
 void handleFlashHighbeam() { Serial.print("Flash Highbeam pressed");      ibus.write(FLASH_HIGHBEAM); }
-
-ButtonAction actions[] = {
-  { VOID,               handleVoid,          },
-  { BTN_CRUISE_MINUS,   handleCruiseMinus,   },
-  { BTN_CRUISE_PLUS,    handleCruisePlus,    },
-  { BTN_CRUISE_IO,      handleCruiseIO,      },
-  { BTN_CRUISE_RESET,   handleCruiseReset,   },
-  { BTN_VOL_UP,         handleVolUp,         },
-  { BTN_VOL_DOWN,       handleVolDown,       },
-  { BTN_NEXT,           handleNext,          },
-  { BTN_PREV,           handlePrev,          },
-  { BTN_RT,             handleRT,            },
-  { BTN_MODE,           handleMode,          },
-  { BTN_FLASH_HIGHBEAM, handleFlashHighbeam, }
-};
 
 void setup()
 {
@@ -179,7 +157,7 @@ void setup()
   }
 
   pinMode(CRUISE_TX_PIN, OUTPUT);
-  digitalWrite(CRUISE_TX_PIN, HIGH);
+  digitalWrite(CRUISE_TX_PIN, LOW);
   initTimer();
 
   ledcSetup(PWM_CHANNEL, PWM_FREQ_HZ, PWM_RESOLUTION);
@@ -204,24 +182,28 @@ void setBrightness(uint8_t linValue) {
   ledcWrite(PWM_CHANNEL, pwm);
 }
 
-void dispatchButton(ButtonType type) {
-  for (auto& action : actions) {
-    if (action.type == type) {
-      action.handler();
-      Serial.println();
-    }
-  }
-}
 
 void checkPins() {
+  unsigned long now = millis();
+
   for (auto &mapping : pinMapping) {
     bool pressed = (digitalRead(mapping.pin) == LOW);
+    bool shouldFire = false;
+
     if (pressed && !mapping.lastState) {
-      if (mapping.alternativeType != VOID && digitalRead(MODE_SWITCH_PIN) == LOW) {
-        dispatchButton(mapping.alternativeType);
-      } else {
-        dispatchButton(mapping.type);
+      shouldFire = true;
+    } else if (pressed && mapping.repeats && (now - mapping.lastActionTime >= BUTTON_REPEAT_DELAY_MS)) {
+      shouldFire = true;
+    }
+
+    if (shouldFire) {
+      if (mapping.alternativeHandler && digitalRead(MODE_SWITCH_PIN) == LOW) {
+        mapping.alternativeHandler();
+      } else if (mapping.handler) {
+        mapping.handler();
       }
+      Serial.println();
+      mapping.lastActionTime = now;
     }
 
     mapping.lastState = pressed;
@@ -276,7 +258,7 @@ void IRAM_ATTR onTimer() {
 
   switch (txState) {
     case TX_IDLE:
-      digitalWrite(CRUISE_TX_PIN, HIGH);
+      digitalWrite(CRUISE_TX_PIN, LOW);
       tickCounter = 0;
       currentByte = (heldCommand == CMD_KEEPALIVE1 || heldCommand == CMD_KEEPALIVE2)
                     ? (keepAliveToggle ? CMD_KEEPALIVE2 : CMD_KEEPALIVE1)
@@ -300,15 +282,15 @@ void IRAM_ATTR onTimer() {
       }
 
       if (tickCounter <= highTicks) {
-        digitalWrite(CRUISE_TX_PIN, HIGH);
-      } else if (tickCounter <= (highTicks + lowTicks)) {
         digitalWrite(CRUISE_TX_PIN, LOW);
+      } else if (tickCounter <= (highTicks + lowTicks)) {
+        digitalWrite(CRUISE_TX_PIN, HIGH);
       } else {
         tickCounter = 0;
         bitIndex--;
         if (bitIndex == 0) {
           lowPulseTicks = STOP_BIT_TICKS;
-          digitalWrite(CRUISE_TX_PIN, LOW);
+          digitalWrite(CRUISE_TX_PIN, HIGH);
           txState = TX_STOP_BIT;
         } else {
           txState = TX_DATA_BIT;
@@ -320,13 +302,13 @@ void IRAM_ATTR onTimer() {
     case TX_STOP_BIT:
       if (tickCounter >= lowPulseTicks) {
         tickCounter = 0;
-        digitalWrite(CRUISE_TX_PIN, HIGH);
+        digitalWrite(CRUISE_TX_PIN, LOW);
         txState = TX_GAP;
       }
       break;
 
     case TX_GAP:
-      digitalWrite(CRUISE_TX_PIN, HIGH);
+      digitalWrite(CRUISE_TX_PIN, LOW);
       if (tickCounter >= TICKS_FOR_GAP) {
         tickCounter = 0;
         txState = TX_IDLE;

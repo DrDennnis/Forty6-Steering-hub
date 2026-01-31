@@ -126,12 +126,6 @@ void scheduleFrame(ButtonCommand cmd) {
   heldCommand = cmd; 
 }
 
-// IBUS media button messages for MFL module (source 0x68)
-uint8_t NEXT_TRACK[7] PROGMEM = {0x50, 0x04, 0x68, 0x3B, 0x01, 0x06};
-uint8_t PREV_TRACK[7] PROGMEM = {0x50, 0x04, 0x68, 0x3B, 0x08, 0x0F};
-uint8_t FLASH_HIGHBEAM[5] PROGMEM = {0x00, 0x04, 0xbf, 0x08};
-uint8_t IBUS_MODE[5] PROGMEM = {0x68, 0x04, 0x3B, 0x40};
-
 void handleCruiseMinus()   { Serial.print("Cruise Minus pressed");        scheduleFrame(CMD_MINUS);   }
 void handleCruisePlus()    { Serial.print("Cruise Plus pressed");         scheduleFrame(CMD_PLUS);    }
 void handleCruiseIO()      { Serial.print("Cruise IO pressed");           scheduleFrame(CMD_IO);      }

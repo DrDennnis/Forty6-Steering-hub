@@ -46,14 +46,14 @@
 #define TIMER_INDEX           0
 #define TIMER_PRESCALER       80
 #define TIMER_INTERVAL_US     100
-#define TICKS_FOR_GAP         100
+#define GAP_BETWEEN_MESSAGES  100
 
 // Cruise control bit timing in timer ticks
 #define BIT_HIGH_TICKS_ONE    4
-#define BIT_LOW_TICKS_ONE     2
+#define BIT_LOW_TICKS_ONE     4
 #define BIT_HIGH_TICKS_ZERO   2
-#define BIT_LOW_TICKS_ZERO    4
-#define STOP_BIT_TICKS        3
+#define BIT_LOW_TICKS_ZERO    6
+#define STOP_BIT_TICKS        1
 #define BITS_PER_BYTE         8
 
 // Repeat interval for held buttons (milliseconds)
@@ -93,7 +93,6 @@ volatile bool keepAliveToggle = false;
 volatile uint8_t currentByte = 0;
 volatile uint8_t bitIndex = BITS_PER_BYTE;
 volatile uint16_t tickCounter = 0;
-volatile uint8_t lowPulseTicks = 0;
 hw_timer_t* timer = NULL; 
 
 void scheduleFrame(ButtonCommand cmd) { 
@@ -257,63 +256,40 @@ void IRAM_ATTR onTimer() {
 
   switch (txState) {
     case TX_IDLE:
-      digitalWrite(CRUISE_TX_PIN, LOW);
-      tickCounter = 0;
-      // Apply toggle bit (bit 0) to ALL commands - alternates every frame
-      currentByte = heldCommand | (keepAliveToggle ? 1 : 0);
+      currentByte = heldCommand | keepAliveToggle;
       keepAliveToggle = !keepAliveToggle;
       bitIndex = BITS_PER_BYTE;
+      tickCounter = 0;
       txState = TX_DATA_BIT;
       break;
 
     case TX_DATA_BIT: {
       bool bit = (currentByte >> (bitIndex - 1)) & 1;
+      uint8_t highTicks = bit ? BIT_HIGH_TICKS_ONE : BIT_HIGH_TICKS_ZERO;
+      uint8_t totalTicks = highTicks + (bit ? BIT_LOW_TICKS_ONE : BIT_LOW_TICKS_ZERO);
 
-      uint8_t highTicks = 0;
-      uint8_t lowTicks = 0;
-      if (bit) {
-        highTicks = BIT_HIGH_TICKS_ONE;
-        lowTicks  = BIT_LOW_TICKS_ONE;
-      } else {
-        highTicks = BIT_HIGH_TICKS_ZERO;
-        lowTicks  = BIT_LOW_TICKS_ZERO;
-      }
+      digitalWrite(CRUISE_TX_PIN, tickCounter <= highTicks ? LOW : HIGH);
 
-      if (tickCounter <= highTicks) {
-        digitalWrite(CRUISE_TX_PIN, LOW);
-      } else if (tickCounter <= (highTicks + lowTicks)) {
-        digitalWrite(CRUISE_TX_PIN, HIGH);
-      } else {
+      if (tickCounter >= totalTicks) {
         tickCounter = 0;
-        bitIndex--;
-        if (bitIndex == 0) {
-          // After last bit, go to stop bit: wire HIGH (ESP32 LOW)
-          // This extended HIGH triggers end-of-frame detection in receivers
-          lowPulseTicks = STOP_BIT_TICKS;
+        if (--bitIndex == 0) {
           digitalWrite(CRUISE_TX_PIN, HIGH);
           txState = TX_STOP_BIT;
-        } else {
-          txState = TX_DATA_BIT;
         }
       }
       break;
     }
 
     case TX_STOP_BIT:
-      // Keep wire HIGH (ESP32 LOW) for stop bit duration
-      // Receivers detect end-of-frame when wire stays HIGH >468µs
-      if (tickCounter >= lowPulseTicks) {
-        tickCounter = 0;
-        // Gap: wire LOW (ESP32 HIGH)
+      if (tickCounter >= STOP_BIT_TICKS) {
         digitalWrite(CRUISE_TX_PIN, LOW);
+        tickCounter = 0;
         txState = TX_GAP;
       }
       break;
 
     case TX_GAP:
-      // Gap between frames: wire LOW (ESP32 HIGH)
-      digitalWrite(CRUISE_TX_PIN, LOW);
-      if (tickCounter >= TICKS_FOR_GAP) {
+      if (tickCounter >= GAP_BETWEEN_MESSAGES) {
         tickCounter = 0;
         txState = TX_IDLE;
       }

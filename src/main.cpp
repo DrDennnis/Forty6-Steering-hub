@@ -49,11 +49,12 @@
 #define GAP_BETWEEN_MESSAGES  100
 
 // Cruise control bit timing in timer ticks
-#define BIT_HIGH_TICKS_ONE    4
+#define BIT_HIGH_TICKS_ONE    3
 #define BIT_LOW_TICKS_ONE     4
-#define BIT_HIGH_TICKS_ZERO   2
+#define BIT_HIGH_TICKS_ZERO   1
 #define BIT_LOW_TICKS_ZERO    6
 #define STOP_BIT_TICKS        1
+#define START_PULSE_TICKS     3
 #define BITS_PER_BYTE         8
 
 // Repeat interval for held buttons (milliseconds)
@@ -72,6 +73,7 @@ struct PinButtonMap {
 
 enum TxState {
   TX_IDLE,
+  TX_START_PULSE,
   TX_DATA_BIT,
   TX_STOP_BIT,
   TX_GAP
@@ -140,7 +142,7 @@ void setup()
   }
 
   pinMode(CRUISE_TX_PIN, OUTPUT);
-  digitalWrite(CRUISE_TX_PIN, LOW);
+  digitalWrite(CRUISE_TX_PIN, LOW);  // Idle state (output HIGH)
   initTimer();
 
   ledcSetup(PWM_CHANNEL, PWM_FREQ_HZ, PWM_RESOLUTION);
@@ -260,7 +262,15 @@ void IRAM_ATTR onTimer() {
       keepAliveToggle = !keepAliveToggle;
       bitIndex = BITS_PER_BYTE;
       tickCounter = 0;
-      txState = TX_DATA_BIT;
+      digitalWrite(CRUISE_TX_PIN, HIGH);  // Start pulse (output LOW) to mark message start
+      txState = TX_START_PULSE;
+      break;
+
+    case TX_START_PULSE:
+      if (tickCounter >= START_PULSE_TICKS) {
+        tickCounter = 0;
+        txState = TX_DATA_BIT;
+      }
       break;
 
     case TX_DATA_BIT: {
@@ -282,7 +292,7 @@ void IRAM_ATTR onTimer() {
 
     case TX_STOP_BIT:
       if (tickCounter >= STOP_BIT_TICKS) {
-        digitalWrite(CRUISE_TX_PIN, LOW);
+        digitalWrite(CRUISE_TX_PIN, LOW);  // Idle state (output HIGH)
         tickCounter = 0;
         txState = TX_GAP;
       }

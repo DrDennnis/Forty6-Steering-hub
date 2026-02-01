@@ -39,6 +39,8 @@
 #define BRIGHTNESS_MAX        100
 #define PWM_VALUE_MIN         0
 #define PWM_VALUE_MAX         255
+#define PWM_OUTPUT_MIN        51   // 20%
+#define PWM_OUTPUT_MAX        153  // 60%
 
 // Timer configuration for 1MHz tick rate (80MHz / 80 prescaler)
 #define TIMER_INDEX           0
@@ -59,17 +61,6 @@
 
 IbusTrx ibus;
 
-// Forward declarations for button handlers
-void handleCruiseMinus();
-void handleCruisePlus();
-void handleCruiseIO();
-void handleCruiseReset();
-void handleVolUp();
-void handleVolDown();
-void handleNext();
-void handlePrev();
-void handleFlashHighbeam();
-
 struct PinButtonMap {
   uint8_t pin;
   void (*handler)();
@@ -78,6 +69,46 @@ struct PinButtonMap {
   bool lastState;
   unsigned long lastActionTime;
 };
+
+enum TxState {
+  TX_IDLE,
+  TX_DATA_BIT,
+  TX_STOP_BIT,
+  TX_GAP
+};
+
+// Cruise control command bytes (base values with bit 0 = 0)
+// Last bit is a toggle bit that alternates every frame for ALL commands
+enum ButtonCommand : uint8_t {
+  CMD_KEEPALIVE = 0b11111110, // idle (no button)
+  CMD_IO        = 0b11011010, // cruise on/off
+  CMD_RESET     = 0b01101110, // resume/set
+  CMD_PLUS      = 0b10110110, // speed +
+  CMD_MINUS     = 0b11111100  // speed -
+};
+
+volatile TxState txState = TX_IDLE;
+volatile ButtonCommand heldCommand = CMD_KEEPALIVE;
+volatile bool keepAliveToggle = false;
+volatile uint8_t currentByte = 0;
+volatile uint8_t bitIndex = BITS_PER_BYTE;
+volatile uint16_t tickCounter = 0;
+volatile uint8_t lowPulseTicks = 0;
+hw_timer_t* timer = NULL; 
+
+void scheduleFrame(ButtonCommand cmd) { 
+  heldCommand = cmd;
+}
+
+void handleCruiseMinus()   { Serial.print("Cruise Minus pressed");        scheduleFrame(CMD_MINUS);   }
+void handleCruisePlus()    { Serial.print("Cruise Plus pressed");         scheduleFrame(CMD_PLUS);    }
+void handleCruiseIO()      { Serial.print("Cruise IO pressed");           scheduleFrame(CMD_IO);      }
+void handleCruiseReset()   { Serial.print("Cruise re-set pressed");       scheduleFrame(CMD_RESET);   }
+void handleVolUp()         { Serial.print("Volume + pressed");            ibus.write(MFL_VOL_UP);     }
+void handleVolDown()       { Serial.print("Volume - pressed");            ibus.write(MFL_VOL_DOWN);   }
+void handleNext()          { Serial.print("Next track pressed");          ibus.write(NEXT_TRACK);     }
+void handlePrev()          { Serial.print("Prev track pressed");          ibus.write(PREV_TRACK);     }
+void handleFlashHighbeam() { Serial.print("Flash Highbeam pressed");      ibus.write(FLASH_HIGHBEAM); }
 
 // Pin to button mappings with alternative actions when mode switch is active
 PinButtonMap pinMapping[] = {
@@ -91,50 +122,9 @@ PinButtonMap pinMapping[] = {
   { BTN_PIN_7, handlePrev,        nullptr,             false, false, 0 },
 };
 
-// Cruise control command bytes
-enum ButtonCommand : uint8_t {
-  CMD_KEEPALIVE1 = 255,
-  CMD_KEEPALIVE2 = 254,
-  CMD_IO         = 219,
-  CMD_RESET      = 111,
-  CMD_PLUS       = 183,
-  CMD_MINUS      = 253
-};
-
-enum TxState {
-  TX_IDLE,
-  TX_DATA_BIT,
-  TX_STOP_BIT,
-  TX_GAP
-};
-volatile TxState txState = TX_IDLE;
-
-volatile ButtonCommand heldCommand = CMD_KEEPALIVE1;
-volatile bool keepAliveToggle = false;
-volatile uint8_t currentByte = 0;
-volatile uint8_t bitIndex = BITS_PER_BYTE;
-volatile uint16_t tickCounter = 0;
-volatile uint8_t lowPulseTicks = 0;
-
-hw_timer_t* timer = NULL; 
-
 void IRAM_ATTR onTimer();
 void initTimer();
 void setBrightness(uint8_t linValue);
-
-void scheduleFrame(ButtonCommand cmd) { 
-  heldCommand = cmd; 
-}
-
-void handleCruiseMinus()   { Serial.print("Cruise Minus pressed");        scheduleFrame(CMD_MINUS);   }
-void handleCruisePlus()    { Serial.print("Cruise Plus pressed");         scheduleFrame(CMD_PLUS);    }
-void handleCruiseIO()      { Serial.print("Cruise IO pressed");           scheduleFrame(CMD_IO);      }
-void handleCruiseReset()   { Serial.print("Cruise re-set pressed");       scheduleFrame(CMD_RESET);   }
-void handleVolUp()         { Serial.print("Volume + pressed");            ibus.write(MFL_VOL_UP);     }
-void handleVolDown()       { Serial.print("Volume - pressed");            ibus.write(MFL_VOL_DOWN);   }
-void handleNext()          { Serial.print("Next track pressed");          ibus.write(NEXT_TRACK);     }
-void handlePrev()          { Serial.print("Prev track pressed");          ibus.write(PREV_TRACK);     }
-void handleFlashHighbeam() { Serial.print("Flash Highbeam pressed");      ibus.write(FLASH_HIGHBEAM); }
 
 void setup()
 {
@@ -170,19 +160,29 @@ uint8_t gammaCorrect(uint8_t value) {
 void setBrightness(uint8_t linValue) {
   linValue = constrain(linValue, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
 
-  uint8_t pwm = map(linValue, BRIGHTNESS_MIN, BRIGHTNESS_MAX, PWM_VALUE_MIN, PWM_VALUE_MAX);
-  pwm = gammaCorrect(pwm);
+  uint8_t pwm;
+  if (linValue == 0) {
+    pwm = 0;  // Turn off completely when lights are off
+  } else {
+    pwm = map(linValue, BRIGHTNESS_MIN, BRIGHTNESS_MAX, PWM_OUTPUT_MIN, PWM_OUTPUT_MAX);
+    pwm = gammaCorrect(pwm);
+  }
 
   ledcWrite(PWM_CHANNEL, pwm);
 }
 
-
 void checkPins() {
   unsigned long now = millis();
+  bool anyCruisePressed = false;
 
   for (auto &mapping : pinMapping) {
     bool pressed = (digitalRead(mapping.pin) == LOW);
     bool shouldFire = false;
+
+    // Track if any cruise button (pins 0-3) is pressed
+    if (pressed && mapping.pin <= BTN_PIN_3) {
+      anyCruisePressed = true;
+    }
 
     if (pressed && !mapping.lastState) {
       shouldFire = true;
@@ -201,6 +201,11 @@ void checkPins() {
     }
 
     mapping.lastState = pressed;
+  }
+
+  // Reset to keepalive when no cruise button is pressed
+  if (!anyCruisePressed && heldCommand != CMD_KEEPALIVE) {
+    heldCommand = CMD_KEEPALIVE;
   }
 }
 
@@ -254,9 +259,8 @@ void IRAM_ATTR onTimer() {
     case TX_IDLE:
       digitalWrite(CRUISE_TX_PIN, LOW);
       tickCounter = 0;
-      currentByte = (heldCommand == CMD_KEEPALIVE1 || heldCommand == CMD_KEEPALIVE2)
-                    ? (keepAliveToggle ? CMD_KEEPALIVE2 : CMD_KEEPALIVE1)
-                    : heldCommand;
+      // Apply toggle bit (bit 0) to ALL commands - alternates every frame
+      currentByte = heldCommand | (keepAliveToggle ? 1 : 0);
       keepAliveToggle = !keepAliveToggle;
       bitIndex = BITS_PER_BYTE;
       txState = TX_DATA_BIT;
@@ -283,6 +287,8 @@ void IRAM_ATTR onTimer() {
         tickCounter = 0;
         bitIndex--;
         if (bitIndex == 0) {
+          // After last bit, go to stop bit: wire HIGH (ESP32 LOW)
+          // This extended HIGH triggers end-of-frame detection in receivers
           lowPulseTicks = STOP_BIT_TICKS;
           digitalWrite(CRUISE_TX_PIN, HIGH);
           txState = TX_STOP_BIT;
@@ -294,14 +300,18 @@ void IRAM_ATTR onTimer() {
     }
 
     case TX_STOP_BIT:
+      // Keep wire HIGH (ESP32 LOW) for stop bit duration
+      // Receivers detect end-of-frame when wire stays HIGH >468µs
       if (tickCounter >= lowPulseTicks) {
         tickCounter = 0;
+        // Gap: wire LOW (ESP32 HIGH)
         digitalWrite(CRUISE_TX_PIN, LOW);
         txState = TX_GAP;
       }
       break;
 
     case TX_GAP:
+      // Gap between frames: wire LOW (ESP32 HIGH)
       digitalWrite(CRUISE_TX_PIN, LOW);
       if (tickCounter >= TICKS_FOR_GAP) {
         tickCounter = 0;

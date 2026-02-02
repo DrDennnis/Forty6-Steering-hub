@@ -10,14 +10,10 @@
 #define LED_PIN           6
 #define CRUISE_TX_PIN     7
 
-#define BTN_PIN_0         0
-#define BTN_PIN_1         1
-#define BTN_PIN_2         2
-#define BTN_PIN_3         3
-#define BTN_PIN_4         4
-#define BTN_PIN_5         5
-#define BTN_PIN_6         8
-#define BTN_PIN_7         9
+// 74HC165 shift register pins
+#define SR_LOAD_PIN       0
+#define SR_CLOCK_PIN      1
+#define SR_DATA_PIN       2
 
 // PWM configuration
 #define PWM_CHANNEL       0
@@ -62,8 +58,7 @@
 
 IbusTrx ibus;
 
-struct PinButtonMap {
-  uint8_t pin;
+struct ButtonMap {
   void (*handler)();
   void (*alternativeHandler)();
   bool repeats;
@@ -111,21 +106,40 @@ void handleNext()          { Serial.print("Next track pressed");          ibus.w
 void handlePrev()          { Serial.print("Prev track pressed");          ibus.write(PREV_TRACK);     }
 void handleFlashHighbeam() { Serial.print("Flash Highbeam pressed");      ibus.write(FLASH_HIGHBEAM); }
 
-// Pin to button mappings with alternative actions when mode switch is active
-PinButtonMap pinMapping[] = {
-  { BTN_PIN_0, handleCruiseMinus, handleFlashHighbeam, true,  false, 0 },
-  { BTN_PIN_1, handleCruisePlus,  nullptr,             true,  false, 0 },
-  { BTN_PIN_2, handleCruiseIO,    nullptr,             false, false, 0 },  // Single press only
-  { BTN_PIN_3, handleCruiseReset, nullptr,             false, false, 0 },  // Single press only
-  { BTN_PIN_4, handleVolUp,       nullptr,             true,  false, 0 },
-  { BTN_PIN_5, handleVolDown,     nullptr,             true,  false, 0 },
-  { BTN_PIN_6, handleNext,        nullptr,             false, false, 0 },
-  { BTN_PIN_7, handlePrev,        nullptr,             false, false, 0 },
+// Button mappings (index = shift register bit), with alternative actions when mode switch is active
+ButtonMap buttonMapping[] = {
+  { handleCruiseMinus, handleFlashHighbeam, true,  false, 0 },
+  { handleCruisePlus,  nullptr,             true,  false, 0 },
+  { handleCruiseIO,    nullptr,             false, false, 0 },  // Single press only
+  { handleCruiseReset, nullptr,             false, false, 0 },  // Single press only
+  { handleVolUp,       nullptr,             true,  false, 0 },
+  { handleVolDown,     nullptr,             true,  false, 0 },
+  { handleNext,        nullptr,             false, false, 0 },
+  { handlePrev,        nullptr,             false, false, 0 },
 };
+constexpr uint8_t NUM_BUTTONS = sizeof(buttonMapping) / sizeof(buttonMapping[0]);
 
 void IRAM_ATTR onTimer();
 void initTimer();
 void setBrightness(uint8_t linValue);
+uint8_t readShiftRegister();
+
+// Read 8 button states from 74HC165 shift register
+uint8_t readShiftRegister() {
+  digitalWrite(SR_LOAD_PIN, LOW);
+  delayMicroseconds(1);
+  digitalWrite(SR_LOAD_PIN, HIGH);
+
+  uint8_t data = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    data <<= 1;
+    data |= digitalRead(SR_DATA_PIN) ? 1 : 0;
+    digitalWrite(SR_CLOCK_PIN, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(SR_CLOCK_PIN, LOW);
+  }
+  return data;
+}
 
 void setup()
 {
@@ -137,9 +151,12 @@ void setup()
   pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
 
-  for (auto &mapping : pinMapping) {
-    pinMode(mapping.pin, INPUT_PULLUP);
-  }
+  // 74HC165 shift register pins
+  pinMode(SR_LOAD_PIN, OUTPUT);
+  pinMode(SR_CLOCK_PIN, OUTPUT);
+  pinMode(SR_DATA_PIN, INPUT);
+  digitalWrite(SR_LOAD_PIN, HIGH);
+  digitalWrite(SR_CLOCK_PIN, LOW);
 
   pinMode(CRUISE_TX_PIN, OUTPUT);
   digitalWrite(CRUISE_TX_PIN, LOW);  // Idle state (output HIGH)
@@ -172,41 +189,38 @@ void setBrightness(uint8_t linValue) {
   ledcWrite(PWM_CHANNEL, pwm);
 }
 
-void checkPins() {
+void checkButtons() {
   unsigned long now = millis();
-  bool anyCruisePressed = false;
+  uint8_t buttonStates = readShiftRegister();
+  bool modeSwitchActive = (digitalRead(MODE_SWITCH_PIN) == LOW);
 
-  for (auto &mapping : pinMapping) {
-    bool pressed = (digitalRead(mapping.pin) == LOW);
+  for (uint8_t i = 0; i < NUM_BUTTONS; i++) {
+    ButtonMap &btn = buttonMapping[i];
+    bool pressed = !(buttonStates & (1 << i));  // Active low
     bool shouldFire = false;
 
-    // Track if any cruise button (pins 0-3) is pressed
-    if (pressed && mapping.pin <= BTN_PIN_3) {
-      anyCruisePressed = true;
-    }
-
-    if (pressed && !mapping.lastState) {
+    if (pressed && !btn.lastState) {
       shouldFire = true;
-    } else if (pressed && mapping.repeats && (now - mapping.lastActionTime >= BUTTON_REPEAT_DELAY_MS)) {
+    } else if (pressed && btn.repeats && (now - btn.lastActionTime >= BUTTON_REPEAT_DELAY_MS)) {
       shouldFire = true;
     }
 
     if (shouldFire) {
-      if (mapping.alternativeHandler && digitalRead(MODE_SWITCH_PIN) == LOW) {
-        mapping.alternativeHandler();
-      } else if (mapping.handler) {
-        mapping.handler();
+      if (btn.alternativeHandler && modeSwitchActive) {
+        btn.alternativeHandler();
+      } else if (btn.handler) {
+        btn.handler();
       }
       Serial.println();
-      mapping.lastActionTime = now;
+      btn.lastActionTime = now;
     }
 
-    mapping.lastState = pressed;
-  }
+    // Reset to keepalive on button release
+    if (!pressed && btn.lastState) {
+      heldCommand = CMD_KEEPALIVE;
+    }
 
-  // Reset to keepalive when no cruise button is pressed
-  if (!anyCruisePressed && heldCommand != CMD_KEEPALIVE) {
-    heldCommand = CMD_KEEPALIVE;
+    btn.lastState = pressed;
   }
 }
 
@@ -238,7 +252,7 @@ void loop()
     handleIbusMessage();
   }
 
-  checkPins();
+  checkButtons();
 }
 
 // Initialize hardware timer for cruise control signal generation
